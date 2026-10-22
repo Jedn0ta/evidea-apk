@@ -1,0 +1,82 @@
+# Sestaví APK aplikace Evidea. Spouští se jen ručně (Actions → „Run workflow“).
+# Veřejné repo = sestavení zdarma. Zdrojový kód se jen načte ze soukromého repa (tajemství SOURCE_TOKEN, jen pro čtení).
+name: Evidea APK
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: apk
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: Jedn0ta/EvidenZ
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.npm
+          key: build-${{ runner.os }}-${{ hashFiles('package.json', 'app.json') }}
+          restore-keys: build-${{ runner.os }}-
+
+      - name: Instalace knihoven
+        run: |
+          .github/ci-step.sh npm install --no-audit --no-fund --legacy-peer-deps
+          .github/ci-step.sh npx expo install --fix -- --legacy-peer-deps
+
+      - name: Testy logiky
+        run: .github/ci-step.sh sh tests/run.sh
+
+      # číslo verze = poslední vydání + 1 → instaluje se jako aktualizace, data zůstanou
+      - name: Číslo verze
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          LAST=$(gh release list --repo Jedn0ta/evidea-apk --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null | tr -dc 0-9 || true)
+          VC=$(( ${LAST:-148} + 1 )); [ "$VC" -lt 149 ] && VC=149
+          echo "VC=$VC" >> "$GITHUB_ENV"
+          node -e '
+            const fs = require("fs");
+            const j = JSON.parse(fs.readFileSync("app.json", "utf8"));
+            j.expo.android.versionCode = Number(process.env.VC);
+            j.expo.extra = { ...(j.expo.extra || {}), buildDate: new Date().toLocaleDateString("sv-SE", { timeZone: "Europe/Prague" }), selfUpdate: true };
+            j.expo.android.permissions = Array.from(new Set([...(j.expo.android.permissions || []), "android.permission.REQUEST_INSTALL_PACKAGES"]));
+            fs.writeFileSync("app.json", JSON.stringify(j, null, 2));
+          '
+
+      - name: Příprava Android projektu
+        run: .github/ci-step.sh npx expo prebuild --platform android --clean --no-install
+
+      - name: Sestavení APK
+        working-directory: android
+        run: ../.github/ci-step.sh ./gradlew assembleRelease -x lintVitalRelease --no-daemon --console=plain
+
+      - name: Vydání
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp android/app/build/outputs/apk/release/app-release.apk Evidea.apk
+          VER=$(node -p 'require("./app.json").expo.version')
+          gh release create "v$VC" Evidea.apk --repo ${{ github.repository }} --title "Evidea $VER ($VC)" --notes "Evidea $VER ($VC)" --latest
