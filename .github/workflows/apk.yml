@@ -69,6 +69,11 @@ jobs:
       - name: Příprava Android projektu
         run: .github/ci-step.sh npx expo prebuild --platform android --clean --no-install
 
+      - name: Kontrola Android projektu
+        run: |
+          grep -n versionCode app.json || true
+          sed -n 1,100p android/app/build.gradle | cat -n | sed -n 60,100p
+
       - name: Sestavení APK
         working-directory: android
         run: ../.github/ci-step.sh ./gradlew assembleRelease -x lintVitalRelease --no-daemon --console=plain
