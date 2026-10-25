@@ -49,6 +49,14 @@ jobs:
       - name: Testy logiky
         run: .github/ci-step.sh sh tests/run.sh
 
+      # kontrola typů: neblokuje sestavení, chyby se ukážou jako upozornění u běhu
+      - name: Kontrola typů
+        run: |
+          npx tsc --noEmit > tsc.txt 2>&1 && echo "typy OK" || {
+            msg=$(head -n 60 tsc.txt | sed -e 's/%/%25/g' | awk 'BEGIN{ORS="%0A"}{print}')
+            echo "::warning title=Kontrola typů::$msg"
+          }
+
       # číslo verze = poslední vydání + 1 → instaluje se jako aktualizace, data zůstanou
       - name: Číslo verze
         env:
