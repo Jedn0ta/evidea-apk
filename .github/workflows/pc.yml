@@ -33,7 +33,9 @@ jobs:
 
       - name: Instalace knihoven
         working-directory: desktop
-        # stažení Electronu občas selže (výpadek serveru) → až 3 pokusy
+        # Electron se tu nestahuje (testy ho nepotřebují); stáhne ho až sestavení instalátoru
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
         run: |
           for i in 1 2 3; do npm install --no-audit --no-fund && exit 0; echo "pokus $i selhal, zkusím znovu"; sleep 20; done
           exit 1
@@ -70,9 +72,13 @@ jobs:
         working-directory: desktop
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        # Electron z GitHubu; když server nestíhá (504), zkusí se záložní zrcadlo
         run: |
           node build.mjs
-          npx electron-builder --win nsis --x64 --publish never
+          npx electron-builder --win nsis --x64 --publish never || {
+            echo "Stažení Electronu z GitHubu selhalo, zkouším zrcadlo"
+            ELECTRON_MIRROR="https://npmmirror.com/mirrors/electron/" npx electron-builder --win nsis --x64 --publish never
+          }
 
       - name: Vydání
         env:
