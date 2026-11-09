@@ -62,7 +62,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          LAST=$(gh release list --repo Jedn0ta/evidea-apk --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null | tr -dc 0-9 || true)
+          # jen vydání aplikace pro telefon (v123), ne pokladny pro PC (pc-1.0.x)
+          LAST=$(gh release list --repo Jedn0ta/evidea-apk --limit 50 --json tagName --jq '[.[].tagName | select(test("^v[0-9]+$"))][0]' 2>/dev/null | tr -dc 0-9 || true)
           VC=$(( ${LAST:-148} + 1 )); [ "$VC" -lt 149 ] && VC=149
           echo "VC=$VC" >> "$GITHUB_ENV"
           export VC
