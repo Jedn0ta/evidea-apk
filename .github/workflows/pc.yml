@@ -33,7 +33,10 @@ jobs:
 
       - name: Instalace knihoven
         working-directory: desktop
-        run: npm install --no-audit --no-fund
+        # stažení Electronu občas selže (výpadek serveru) → až 3 pokusy
+        run: |
+          for i in 1 2 3; do npm install --no-audit --no-fund && exit 0; echo "pokus $i selhal, zkusím znovu"; sleep 20; done
+          exit 1
 
       # kontrola typů: neblokuje sestavení, chyby se ukážou jako upozornění u běhu
       - name: Kontrola typů
