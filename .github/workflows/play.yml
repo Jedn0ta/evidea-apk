@@ -1,0 +1,178 @@
+# Sestaví podepsaný balíček .aab pro Google Play (Evidea, com.onoseto.evidea).
+# Spouští se jen ručně: Actions → „Google Play (AAB)“ → Run workflow.
+#
+# Veřejné repo = sestavení zdarma. Zdrojový kód se jen načte ze soukromého repa (SOURCE_TOKEN).
+# Hotový .aab NENÍ veřejně ke stažení: je v archivu .zip zašifrovaném heslem nahrávacího klíče
+# a leží jen v „Artifacts“ tohoto běhu (14 dní). Stáhni, rozbal heslem a nahraj do Play Console.
+#
+# Tajemství (Settings → Secrets and variables → Actions):
+#   SOURCE_TOKEN               – čtení soukromého repa (už je)
+#   UPLOAD_KEYSTORE_B64        – nahrávací klíč .keystore převedený do base64
+#   UPLOAD_KEYSTORE_PASSWORD   – heslo ke klíči (zároveň heslo k archivu s .aab)
+#   UPLOAD_KEY_ALIAS           – nepovinné, výchozí „evidenz-upload“
+name: Google Play (AAB)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: play
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  aab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Kontrola tajemství
+        env:
+          KS: ${{ secrets.UPLOAD_KEYSTORE_B64 }}
+          PW: ${{ secrets.UPLOAD_KEYSTORE_PASSWORD }}
+        run: |
+          # bez klíče proběhne jen zkušební sestavení (ověří, že se aplikace sestaví) – nic se nezveřejní
+          if [ -z "$KS" ] || [ -z "$PW" ]; then
+            echo "::warning title=Chybí nahrávací klíč – jen zkušební sestavení::Pro soubor do Google Play přidej v Settings → Secrets and variables → Actions tajemství UPLOAD_KEYSTORE_B64 a UPLOAD_KEYSTORE_PASSWORD."
+            echo "TRIAL=1" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/checkout@v5
+        with:
+          repository: Jedn0ta/EvidenZ
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.npm
+          key: play-${{ runner.os }}-${{ hashFiles('package.json', 'app.json') }}
+          restore-keys: play-${{ runner.os }}-
+
+      - name: Instalace knihoven
+        run: |
+          .github/ci-step.sh npm install --no-audit --no-fund --legacy-peer-deps
+          .github/ci-step.sh npx expo install --fix -- --legacy-peer-deps
+
+      - name: Testy logiky a bezpečnosti
+        run: .github/ci-step.sh sh tests/run.sh
+
+      # kontrola typů: neblokuje sestavení, chyby se ukážou jako upozornění u běhu
+      - name: Kontrola typů
+        run: |
+          npx tsc --noEmit > tsc.txt 2>&1 && echo "typy OK" || {
+            msg=$(head -n 60 tsc.txt | sed -e 's/%/%25/g' | awk 'BEGIN{ORS="%0A"}{print}')
+            echo "::warning title=Kontrola typů::$msg"
+          }
+
+      # každé nahrání do Google Play musí mít vyšší versionCode → číslo běhu tohoto workflow
+      - name: Číslo verze
+        env:
+          RUN: ${{ github.run_number }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const j = JSON.parse(fs.readFileSync("app.json", "utf8"));
+            j.expo.android.versionCode = Number(process.env.RUN);
+            j.expo.extra = { ...(j.expo.extra || {}), buildDate: new Date().toLocaleDateString("sv-SE", { timeZone: "Europe/Prague" }) };
+            fs.writeFileSync("app.json", JSON.stringify(j, null, 2));
+          '
+          echo "VC=$RUN" >> "$GITHUB_ENV"
+          echo "VER=$(node -p 'require("./app.json").expo.version')" >> "$GITHUB_ENV"
+
+      - name: Příprava Android projektu
+        run: .github/ci-step.sh npx expo prebuild --platform android --clean --no-install
+
+      - name: Podpis nahrávacím klíčem
+        env:
+          KS: ${{ secrets.UPLOAD_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$TRIAL" ]; then
+            # dočasný klíč jen pro zkušební sestavení (takový .aab do Google Play nahrát nejde)
+            keytool -genkeypair -keystore android/app/upload.keystore -storepass trialtrial -keypass trialtrial -alias evidenz-upload -keyalg RSA -keysize 2048 -validity 2 -dname "CN=Zkusebni" > /dev/null
+            { echo "UPLOAD_KEYSTORE_PASSWORD=trialtrial"; echo "UPLOAD_KEY_ALIAS=evidenz-upload"; } >> "$GITHUB_ENV"
+          else
+            echo "$KS" | base64 -d > android/app/upload.keystore
+          fi
+          cat >> android/app/build.gradle <<'EOF'
+
+          // podpis nahrávacím klíčem (Google Play App Signing)
+          android {
+            signingConfigs {
+              upload {
+                storeFile file("upload.keystore")
+                storePassword System.getenv("UPLOAD_KEYSTORE_PASSWORD")
+                keyAlias System.getenv("UPLOAD_KEY_ALIAS") ?: "evidenz-upload"
+                keyPassword System.getenv("UPLOAD_KEYSTORE_PASSWORD")
+              }
+            }
+            buildTypes {
+              release {
+                signingConfig signingConfigs.upload
+              }
+            }
+          }
+          EOF
+
+      - name: Sestavení .aab
+        working-directory: android
+        env:
+          SECRET_PW: ${{ secrets.UPLOAD_KEYSTORE_PASSWORD }}
+          SECRET_ALIAS: ${{ secrets.UPLOAD_KEY_ALIAS }}
+        run: |
+          # klíč z tajemství (u zkušebního sestavení už je nastavený dočasný)
+          if [ -z "$TRIAL" ]; then export UPLOAD_KEYSTORE_PASSWORD="$SECRET_PW" UPLOAD_KEY_ALIAS="${SECRET_ALIAS:-evidenz-upload}"; fi
+          ../.github/ci-step.sh ./gradlew bundleRelease -x lintVitalRelease --no-daemon --console=plain
+
+      # kontrola pro Google Play: balíček, oprávnění (žádná instalace APK), knihovna plateb
+      - name: Kontrola balíčku a oprávnění
+        run: |
+          M=$(find android/app/build/intermediates -path "*release*" -name AndroidManifest.xml | grep -i merged | head -n 1)
+          echo "Manifest: $M"
+          grep -o 'package="[^"]*"' "$M" | head -n 1
+          PERMS=$(grep -o 'uses-permission[^>]*android:name="[^"]*"' "$M" | sed 's/.*android:name="//; s/"$//' | sort -u)
+          echo "$PERMS"
+          echo "::notice title=Oprávnění v balíčku::$(echo "$PERMS" | tr '\n' ' ')"
+          for bad in REQUEST_INSTALL_PACKAGES READ_CALL_LOG READ_SMS SYSTEM_ALERT_WINDOW MANAGE_EXTERNAL_STORAGE QUERY_ALL_PACKAGES RECORD_AUDIO; do
+            if echo "$PERMS" | grep -q "\.$bad$"; then echo "::error title=Oprávnění, které Google Play omezuje::$bad"; exit 1; fi
+          done
+          echo "$PERMS" | grep -q "com.android.vending.BILLING" || { echo "::error title=Chybí platby Google Play::com.android.vending.BILLING"; exit 1; }
+          grep -q 'package="com.onoseto.evidea"' "$M" || grep -q 'com.onoseto.evidea' android/app/build.gradle
+
+      - name: Kontrola podpisu a zašifrování
+        env:
+          PW: ${{ secrets.UPLOAD_KEYSTORE_PASSWORD }}
+        run: |
+          F=android/app/build/outputs/bundle/release/app-release.aab
+          OUT="Evidea-$VER-$VC.aab"
+          cp "$F" "$OUT"
+          SHA=$(keytool -printcert -jarfile "$OUT" | grep -m1 "SHA256:" | sed 's/.*SHA256: //')
+          [ -n "$SHA" ] || { echo "::error title=Balíček není podepsaný::"; exit 1; }
+          if [ -n "$TRIAL" ]; then
+            echo "::notice title=Zkušební sestavení prošlo::Evidea $VER (versionCode $VC) se sestavila. Bez nahrávacího klíče se soubor pro Google Play nevytváří."
+            rm -f "$OUT" android/app/upload.keystore
+            exit 0
+          fi
+          echo "::notice title=Hotovo – Evidea $VER (versionCode $VC)::Otisk nahrávacího klíče SHA-256: $SHA. Soubor je v Artifacts níže, archiv rozbalíš heslem nahrávacího klíče."
+          7z a -tzip -mem=AES256 -p"$PW" "Evidea-$VER-$VC.zip" "$OUT" > /dev/null
+          rm -f "$OUT" android/app/upload.keystore
+
+      - uses: actions/upload-artifact@v4
+        if: env.TRIAL != '1'
+        with:
+          name: Evidea-${{ env.VER }}-${{ env.VC }}-google-play
+          path: Evidea-${{ env.VER }}-${{ env.VC }}.zip
+          retention-days: 14
